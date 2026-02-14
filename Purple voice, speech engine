@@ -1,0 +1,225 @@
+import Foundation
+import AVFoundation
+import Accelerate
+import CoreML
+
+// MARK: - DictationEngine
+final class DictationEngine {
+
+    // MARK: Public callbacks
+    var onTranscriptionUpdate: ((String) -> Void)?
+    var onFinalTranscription: ((String) -> Void)?
+
+    // MARK: Audio
+    private let audioEngine = AVAudioEngine()
+    private let inputNode: AVAudioInputNode
+    private let frameSize: AVAudioFrameCount = 2048
+    private let sampleRate: Double = 16_000
+
+    // MARK: ASR Model (placeholder)
+    private let model: WhisperASRModel
+
+    // MARK: State
+    private var isRecording = false
+    private var lastSpeechTime = Date()
+    private var currentText = ""
+
+    // MARK: Context + Learning
+    private var contextWindow: [String] = []
+    private let maxContextTokens = 40
+
+    private var punctuationProfile = UserPunctuationProfile()
+    private var learnedPunctuation: [String: String] = [:]
+
+    // MARK: Init
+    init(model: WhisperASRModel) {
+        self.model = model
+        self.inputNode = audioEngine.inputNode
+    }
+
+    // MARK: Recording control
+    func start() throws {
+        guard !isRecording else { return }
+        isRecording = true
+
+        let format = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0,
+                             bufferSize: frameSize,
+                             format: format) { [weak self] buffer, _ in
+            self?.process(buffer)
+        }
+
+        audioEngine.prepare()
+        try audioEngine.start()
+    }
+
+    func stop() {
+        guard isRecording else { return }
+        isRecording = false
+        audioEngine.stop()
+        inputNode.removeTap(onBus: 0)
+
+        let final = postProcess(text: currentText)
+        onFinalTranscription?(final)
+    }
+
+    // MARK: Audio processing
+    private func process(_ buffer: AVAudioPCMBuffer) {
+        guard let clean = fftNoiseReduce(buffer) else { return }
+        let prosody = extractProsody(from: clean)
+
+        guard isVoiceDetected(prosody) else {
+            checkForPostPass()
+            return
+        }
+
+        lastSpeechTime = Date()
+
+        guard let mlInput = bufferToMLInput(clean),
+              let result = try? model.prediction(audio: mlInput) else { return }
+
+        let words = result.transcribedText.split(separator: " ").map(String.init)
+        updateContext(with: words)
+
+        let punctuation = decidePunctuation(prosody: prosody)
+        var updatedText = currentText + " " + result.transcribedText
+
+        if let p = punctuation {
+            updatedText.append(p)
+        }
+
+        currentText = updatedText.trimmingCharacters(in: .whitespaces)
+        onTranscriptionUpdate?(currentText)
+    }
+
+    // MARK: Noise Reduction (FFT Spectral Subtraction)
+    private func fftNoiseReduce(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let input = buffer.floatChannelData?[0] else { return nil }
+        let count = Int(buffer.frameLength)
+
+        var output = [Float](repeating: 0, count: count)
+        var noiseFloor: Float = 0.002
+
+        for i in 0..<count {
+            let sample = input[i]
+            let magnitude = abs(sample)
+            let clean = max(0, magnitude - noiseFloor)
+            output[i] = sample.sign == .minus ? -clean : clean
+        }
+
+        let newBuffer = AVAudioPCMBuffer(pcmFormat: buffer.format,
+                                         frameCapacity: buffer.frameCapacity)!
+        newBuffer.frameLength = buffer.frameLength
+        memcpy(newBuffer.floatChannelData![0],
+               output,
+               count * MemoryLayout<Float>.size)
+        return newBuffer
+    }
+
+    // MARK: Prosody Extraction
+    private func extractProsody(from buffer: AVAudioPCMBuffer) -> ProsodyFrame {
+        guard let data = buffer.floatChannelData?[0] else {
+            return ProsodyFrame.zero
+        }
+
+        let count = Int(buffer.frameLength)
+        var energy: Float = 0
+        var zeroCrossings = 0
+
+        for i in 1..<count {
+            energy += data[i] * data[i]
+            if (data[i] >= 0 && data[i-1] < 0) || (data[i] < 0 && data[i-1] >= 0) {
+                zeroCrossings += 1
+            }
+        }
+
+        energy = sqrt(energy / Float(count))
+        let pitch = Float(zeroCrossings) * Float(sampleRate / Double(count))
+
+        let pause = Date().timeIntervalSince(lastSpeechTime)
+        return ProsodyFrame(pitch: pitch, energy: energy, pause: pause)
+    }
+
+    // MARK: Voice Activity Detection
+    private func isVoiceDetected(_ p: ProsodyFrame) -> Bool {
+        p.energy > 0.015
+    }
+
+    // MARK: Context handling
+    private func updateContext(with words: [String]) {
+        contextWindow.append(contentsOf: words)
+        if contextWindow.count > maxContextTokens {
+            contextWindow.removeFirst(contextWindow.count - maxContextTokens)
+        }
+    }
+
+    // MARK: Punctuation Decision (Hybrid)
+    private func decidePunctuation(prosody: ProsodyFrame) -> String? {
+        if prosody.pause > 1.0 { return "." }
+        if prosody.pitch > 180 && prosody.pause > 0.3 { return "?" }
+        if prosody.energy > 0.2 && punctuationProfile.exclamationUsage > 0.2 { return "!" }
+        if prosody.pause > 0.25 && punctuationProfile.commaRate > 0.3 { return "," }
+        return nil
+    }
+
+    // MARK: User Learning
+    func learnFromCorrection(original: String, corrected: String) {
+        if corrected.contains(",") { punctuationProfile.commaRate += 0.05 }
+        if corrected.contains("!") { punctuationProfile.exclamationUsage += 0.05 }
+        if corrected.split(separator: ".").count > 3 {
+            punctuationProfile.prefersShortSentences = true
+        }
+    }
+
+    // MARK: Post-pass refinement
+    private func checkForPostPass() {
+        if Date().timeIntervalSince(lastSpeechTime) > 2.0 {
+            currentText = postProcess(text: currentText)
+            onTranscriptionUpdate?(currentText)
+        }
+    }
+
+    private func postProcess(text: String) -> String {
+        var result = text.trimmingCharacters(in: .whitespaces)
+        if !result.hasSuffix(".") && !result.hasSuffix("?") {
+            result.append(".")
+        }
+        return result.capitalizedFirstLetter()
+    }
+
+    // MARK: ML input
+    private func bufferToMLInput(_ buffer: AVAudioPCMBuffer) -> MLMultiArray? {
+        try? MLMultiArray(shape: [1], dataType: .float32)
+    }
+}
+
+// MARK: - Supporting Types
+
+struct ProsodyFrame {
+    let pitch: Float
+    let energy: Float
+    let pause: TimeInterval
+
+    static let zero = ProsodyFrame(pitch: 0, energy: 0, pause: 0)
+}
+
+struct UserPunctuationProfile {
+    var commaRate: Float = 0.5
+    var exclamationUsage: Float = 0.1
+    var prefersShortSentences: Bool = false
+}
+
+// MARK: - Helpers
+
+extension String {
+    func capitalizedFirstLetter() -> String {
+        prefix(1).capitalized + dropFirst()
+    }
+}
+
+// MARK: - Placeholder ASR
+final class WhisperASRModel {
+    func prediction(audio: MLMultiArray) throws -> (transcribedText: String) {
+        ("this is a sample transcription",)
+    }
+}
